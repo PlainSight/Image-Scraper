@@ -1,138 +1,146 @@
 package main
 
 import (
-    "fmt"
-    "os"
-    "github.com/PuerkitoBio/goquery"
-    "io"
-    "net/http"
-    "strings"
-    "sync"
+	"fmt"
+	"github.com/PuerkitoBio/goquery"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
 )
 
-
-var inserts sync.WaitGroup
+var crawls sync.WaitGroup
 var downloads sync.WaitGroup
 
-func CrawlPage(url string, ch chan string) {
-	fmt.Printf("\n\nFetching Page..\n")
-    resp, err := goquery.NewDocument(url)
+func crawlPage(url string, ch chan string, sem chan bool) {
+	sem <- true
 
-    if err != nil {
-        fmt.Printf("ERROR: Failed to crawl \"" + url + "\"\n\n")
-        os.Exit(3)
-    }
+	defer func() {
+		crawls.Done()
+		<-sem
+	}()
 
-    // use CSS selector found with the browser inspector
-    // for each, use index and item
-    resp.Find("*").Each(func(index int, item *goquery.Selection) {
-        linkTag := item.Find("img")
-        link, _ := linkTag.Attr("src")
+	fmt.Printf("Fetching Page: %v \n", url)
+	resp, err := goquery.NewDocument(url)
 
-        if link != ""{
-        	ch <- link
-        }
-    })
+	if err != nil {
+		fmt.Printf("ERROR: Failed to crawl \"" + url + "\"\n")
+		return
+	}
 
-    inserts.Done()
+	// select each image, extract src
+	resp.Find("img").Each(func(index int, item *goquery.Selection) {
+		link, _ := item.Attr("src")
+
+		if link != "" {
+			fmt.Printf("Found: %v \n", link)
+			ch <- link
+		}
+	})
 }
 
-func CrawlPages(urls []string, imageUrls chan string){
-    // Crawl process (concurrently)
-    for _, url := range urls {
-        if url[:4] != "http"{
-            url = "http://" + url
-        }
-        inserts.Add(1)
-        go CrawlPage(url, imageUrls)
-    }
+func crawlPages(urls []string, imageUrls chan string) {
+	concurrency := 5
+	sem := make(chan bool, concurrency)
+
+	// Crawl process (concurrently)
+	for _, url := range urls {
+		if url[:4] != "http" {
+			url = "http://" + url
+		}
+		crawls.Add(1)
+		go crawlPage(url, imageUrls, sem)
+	}
 }
 
 // takes a channel of incoming URLs and outputs a channel of unique URLs
-func EnsureUnique(in chan string, out chan string) {   
-    allUrls := make(map[string]bool)
+func ensureUnique(in chan string, out chan string) {
+	allUrls := make(map[string]bool)
 
-    go func() {
-        for url := range in {
-            if !allUrls[url] {
-                allUrls[url] = true
-                fmt.Printf("Enqueuing %s \n", url)
-                out <- url
-            }
-        }
-        // once in closes and the last url is pushed onto the out
-        close(out)
-    }()
+	go func() {
+		for url := range in {
+			if !allUrls[url] {
+				allUrls[url] = true
+				out <- url
+			}
+		}
+		// close 'out' once 'in' closes and the last url is pushed onto 'out'
+		close(out)
+	}()
 }
 
-func DownloadImage(url string, folder string, sem chan bool) {
+func downloadImage(url string, folder string, sem chan bool) {
 	os.Mkdir(folder, os.FileMode(0777))
-    defer downloads.Done()
 
-    if url[:4] != "http"{
-        url = "http:" + url
-    }
+	sem <- true
+	defer func() {
+		downloads.Done()
+		<-sem
+	}()
+
+	if url[:4] != "http" {
+		url = "http:" + url
+	}
 	parts := strings.Split(url, "/")
 	name := parts[len(parts)-1]
 	file, err := os.Create(string(folder + "/" + name))
-    defer file.Close()
-    if err != nil {
-        fmt.Printf("%v", err)
-        return
-    }
+	if err != nil {
+		fmt.Printf("%v \n", err)
+		return
+	}
+	defer file.Close()
 	resp, err := http.Get(url)
-    if err != nil {
-        fmt.Printf("%v", err)
-        return
-    }
+	if err != nil {
+		fmt.Printf("%v \n", err)
+		return
+	}
+	defer resp.Body.Close()
+
 	io.Copy(file, resp.Body)
-	resp.Body.Close()
 
-	fmt.Printf("Saving %s \n", folder + "/" + name)
-
-    <- sem
+	fmt.Printf("Saving %s \n", folder+"/"+name)
 }
 
-func DownloadImages(in chan string, Folder string) {
+func downloadImages(in chan string, Folder string) {
 
-    concurrency := 5
-    sem := make(chan bool, concurrency)
+	concurrency := 5
+	sem := make(chan bool, concurrency)
 
-    go func() {
-        for ui := range in {
-            sem <- true
-            downloads.Add(1)
-            go DownloadImage(ui, Folder, sem)
-        }
-    }()
+	go func() {
+		for ui := range in {
+			downloads.Add(1)
+			go downloadImage(ui, Folder, sem)
+		}
+	}()
 }
 
 func main() {
-    if len(os.Args) < 3 {
-    	fmt.Println("ERROR : Less Args\nCommand should be of type : imagescraper [folder to save] [websites]\n\n")
-    	os.Exit(3)  	
-    }
-    
-    Folder := os.Args[1]
-    seedUrls := os.Args[2:]
+	if len(os.Args) < 3 {
+		fmt.Println("ERROR : Less Args\nCommand should be of type : imagescraper [folder to save] [websites]\n\n")
+		os.Exit(3)
+	}
 
-    imageUrls := make(chan string)
-    uniqueImgUrls := make(chan string)
+	Folder := os.Args[1]
+	seedUrls := os.Args[2:]
 
-    // Crawl websites and push image urls onto the imageUrls channel
-    CrawlPages(seedUrls, imageUrls)
+	imageUrls := make(chan string)
+	uniqueImgUrls := make(chan string)
 
-    // Ingest urls from imageUrls channel and output unique images onto uniqueImageUrls channel
-    EnsureUnique(imageUrls, uniqueImgUrls)
+	// Crawl websites and push image urls onto the imageUrls channel
+	crawlPages(seedUrls, imageUrls)
 
-    // Ingest urls from uniqueImageUrls channel, download and write into Folder
-    DownloadImages(uniqueImgUrls, Folder)
+	// Ingest urls from imageUrls channel and output unique images onto uniqueImageUrls channel
+	ensureUnique(imageUrls, uniqueImgUrls)
 
-    // inserts waitgroup is incremented by the Crawl
-    inserts.Wait()
-    close(imageUrls)
-    
-    downloads.Wait()
-    fmt.Printf("\n\nScraped succesfully\n\n")
+	// Ingest urls from uniqueImageUrls channel, download and write into Folder
+	downloadImages(uniqueImgUrls, Folder)
+
+	// inserts waitgroup is incremented by the Crawl
+	crawls.Wait()
+	close(imageUrls)
+
+	downloads.Wait()
+	fmt.Printf("\n\nScraped succesfully\n\n")
 
 }
